@@ -104,6 +104,19 @@ Each step is a working system. Each step's results inform the next.
 
 No plan beyond Step 5. The architecture is itself a projection held provisionally.
 
+### Step 1 Results
+
+First test: Monty Hall problem with Qwen3-8B-4bit via vllm-mlx.
+
+**What worked:**
+- Three framings (structural, skeptical, concrete) produced genuinely different reasoning paths from the same model. The structural framing produced formal probability analysis, the skeptical framing used Bayesian inference to check assumptions, and the concrete framing traced through case enumeration.
+- The composer correctly identified what necessarily followed across all three collapses and produced a clear resolution (switch, 2/3 probability).
+- The shadow report identified real blind spots: unstated assumptions about host behavior, alternative game rules not considered, and why the 50/50 intuition persists.
+
+**What to investigate:**
+- Qwen3's `<think>` tokens appear in collapse output. These contain the model's chain-of-thought reasoning. Decision needed: strip them before composition (cleaner input) or keep them (more signal for the composer).
+- Same-model collapses converge on similar reasoning despite different framings — all three reached the same conclusion via overlapping logic. Step 2's cross-model diversity may produce more structurally different projections.
+
 ## Lineage
 
 This project derives from insights discovered through two prior implementations, both now archived:
