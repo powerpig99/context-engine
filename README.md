@@ -47,12 +47,17 @@ pip install -e .
 
 ### Local Model Setup (Step 1)
 
-Step 1 runs on a local model via MLX. Store model weights outside iCloud-synced directories:
+Step 1 uses [vllm-mlx](https://github.com/waybarrios/vllm-mlx) to serve a local model via an OpenAI-compatible API. Install vllm-mlx and download a model:
 
 ```bash
-# Download Qwen3-8B base to local storage
-mkdir -p ~/Models/qwen3-8b
-# (MLX model download instructions)
+pip install vllm-mlx
+mlx_lm.convert --hf-path Qwen/Qwen3-8B -q --mlx-path ~/Models/Qwen3-8B-4bit
+```
+
+Start the inference server:
+
+```bash
+vllm-mlx serve ~/Models/Qwen3-8B-4bit --port 8000 --continuous-batching
 ```
 
 ### API Setup (Step 2+)
@@ -68,20 +73,20 @@ export GOOGLE_API_KEY=...
 ## Usage
 
 ```bash
-# Basic: run the loop on a question
+# Basic: run the loop on a question (requires vllm-mlx running on port 8000)
 python -m context_engine "Your question here"
 
-# Specify model (local)
-python -m context_engine --model ~/Models/qwen3-8b "Your question here"
+# Point to a different OpenAI-compatible server
+python -m context_engine --base-url http://localhost:8000/v1 "Your question here"
 
-# Cross-model (Step 2+)
-python -m context_engine --models claude-sonnet,gpt-4o,gemini-2.5-pro "Your question here"
+# Control number of collapses and temperature
+python -m context_engine --num-collapses 3 --temperature 0.7 "Your question here"
 
-# Control iteration
-python -m context_engine --max-iterations 3 "Your question here"
-
-# Save full trace
+# Save full trace (all collapses + composition)
 python -m context_engine --save output.json "Your question here"
+
+# Verbose: print individual collapses before composition
+python -m context_engine --verbose "Your question here"
 ```
 
 ## Development Steps

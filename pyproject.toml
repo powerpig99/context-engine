@@ -1,0 +1,18 @@
+[project]
+name = "context-engine"
+version = "0.1.0"
+description = "Reasoning through multiple independent collapses composed by necessity"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "openai>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
