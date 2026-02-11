@@ -42,7 +42,7 @@ The models already have the patterns. All of training is already in the weights.
 ```bash
 git clone https://github.com/powerpig99/context-engine.git
 cd context-engine
-pip install -e .
+uv sync
 ```
 
 ### Local Model Setup (Step 1)
@@ -50,7 +50,7 @@ pip install -e .
 Step 1 uses [vllm-mlx](https://github.com/waybarrios/vllm-mlx) to serve a local model via an OpenAI-compatible API. Install vllm-mlx and download a model:
 
 ```bash
-pip install vllm-mlx
+uv pip install vllm-mlx
 mlx_lm.convert --hf-path Qwen/Qwen3-8B -q --mlx-path ~/Models/Qwen3-8B-4bit
 ```
 
