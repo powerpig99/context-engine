@@ -2,7 +2,7 @@
 Minimal working example of the Context Engine (Step 1: single pass, no iteration).
 
 Requires vllm-mlx running:
-    vllm-mlx serve ~/Models/Qwen3-8B-4bit --port 8000 --continuous-batching
+    vllm-mlx serve mlx-community/Qwen3-8B-4bit --port 8000 --continuous-batching
 """
 
 from context_engine.context_constructor import construct_collapses

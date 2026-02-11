@@ -71,7 +71,7 @@ def main():
             print(
                 f"\nCould not connect to {args.base_url}\n"
                 "Is vllm-mlx running? Start it with:\n"
-                "  vllm-mlx serve ~/Models/Qwen3-8B-4bit --port 8000 --continuous-batching",
+                "  vllm-mlx serve mlx-community/Qwen3-8B-4bit --port 8000 --continuous-batching",
                 file=sys.stderr,
             )
             sys.exit(1)

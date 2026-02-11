@@ -47,17 +47,18 @@ uv sync
 
 ### Local Model Setup (Step 1)
 
-Step 1 uses [vllm-mlx](https://github.com/waybarrios/vllm-mlx) to serve a local model via an OpenAI-compatible API. Install vllm-mlx and download a model:
+Step 1 uses [vllm-mlx](https://github.com/waybarrios/vllm-mlx) to serve a local model via an OpenAI-compatible API.
+
+Install vllm-mlx:
 
 ```bash
-uv pip install vllm-mlx
-mlx_lm.convert --hf-path Qwen/Qwen3-8B -q --mlx-path ~/Models/Qwen3-8B-4bit
+uv tool install git+https://github.com/waybarrios/vllm-mlx.git
 ```
 
-Start the inference server:
+Start the inference server with a model (downloads from HuggingFace on first run):
 
 ```bash
-vllm-mlx serve ~/Models/Qwen3-8B-4bit --port 8000 --continuous-batching
+vllm-mlx serve mlx-community/Qwen3-8B-4bit --port 8000 --continuous-batching
 ```
 
 ### API Setup (Step 2+)

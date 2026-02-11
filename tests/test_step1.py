@@ -4,7 +4,7 @@ Step 1 validation tests.
 Run with: pytest tests/test_step1.py -v -s
 
 Requires vllm-mlx running locally:
-    vllm-mlx serve ~/Models/Qwen3-8B-4bit --port 8000 --continuous-batching
+    vllm-mlx serve mlx-community/Qwen3-8B-4bit --port 8000 --continuous-batching
 
 Tests are a mix of:
 - Structural assertions (does the pipeline produce the right shape of output?)
