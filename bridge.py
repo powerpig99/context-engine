@@ -12,11 +12,14 @@ Usage:
     python bridge.py update bridge.md new_content.md
     python bridge.py compare bridge.md documents/full.md "question"
     python bridge.py run documents/text.md "question1" "question2" ...
+    python bridge.py benchmark benchmarks/oolong_trec_coarse.json --limit 10
 """
 
 import argparse
 import json
+import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -29,16 +32,20 @@ MODEL = "default"
 
 
 def generate(system_prompt: str, user_prompt: str, temperature: float = 0.5, max_tokens: int = 4096) -> str:
+    # Prepend /no_think to disable Qwen3's <think> mode for faster, direct responses
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": "/no_think\n" + user_prompt},
         ],
         temperature=temperature,
         max_tokens=max_tokens,
     )
-    return response.choices[0].message.content
+    text = response.choices[0].message.content
+    # Strip any residual <think>...</think> blocks from Qwen3
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    return text
 
 
 # --- Core operations ---
@@ -224,6 +231,94 @@ def cmd_run(args):
         print(f"\nResults saved to {args.save}")
 
 
+def cmd_benchmark(args):
+    """Run bridge approach on OOLONG benchmark, compare to full-context baseline."""
+    from rlm_oolong import parse_answer_field, extract_answer, score_answer
+
+    tasks = json.loads(Path(args.data).read_text())
+    for task in tasks:
+        task["answer"] = parse_answer_field(task["answer"])
+    if args.limit:
+        tasks = tasks[:args.limit]
+    print(f"Loaded {len(tasks)} tasks from {args.data}")
+
+    results = []
+    for i, task in enumerate(tasks):
+        ctx = task["context_window_text"]
+        question = task["question"]
+        print(f"\n  [{i+1}/{len(tasks)}] ctx={task['context_len']} task={task['task']}")
+
+        # 1. Build bridge from context
+        t0 = time.time()
+        bridge = build_bridge(ctx)
+        bridge_time = time.time() - t0
+        ratio = len(bridge) / len(ctx)
+        print(f"    Bridge: {len(bridge)} chars ({ratio*100:.0f}% of {len(ctx)}) in {bridge_time:.1f}s")
+
+        # 2. Answer from bridge
+        t0 = time.time()
+        answer_from_bridge = answer(question, bridge)
+        bridge_answer_time = time.time() - t0
+        bridge_extracted = extract_answer(answer_from_bridge)
+        bridge_score = score_answer(answer_from_bridge, task["answer"], task["answer_type"])
+
+        # 3. Answer from full context (control)
+        t0 = time.time()
+        answer_from_full = answer(question, ctx)
+        full_answer_time = time.time() - t0
+        full_extracted = extract_answer(answer_from_full)
+        full_score = score_answer(answer_from_full, task["answer"], task["answer_type"])
+
+        b_label = f"OK ({bridge_score:.2f})" if bridge_score > 0 else "WRONG"
+        f_label = f"OK ({full_score:.2f})" if full_score > 0 else "WRONG"
+        print(f"    Bridge answer: {b_label} [{bridge_extracted[:60]}]")
+        print(f"    Full answer:   {f_label} [{full_extracted[:60]}]")
+
+        results.append({
+            "id": task["id"],
+            "context_len": task["context_len"],
+            "task": task["task"],
+            "task_group": task["task_group"],
+            "question": question,
+            "gold": task["answer"],
+            "bridge_size": len(bridge),
+            "bridge_ratio": ratio,
+            "bridge_answer": answer_from_bridge,
+            "bridge_extracted": bridge_extracted,
+            "bridge_score": bridge_score,
+            "bridge_time_s": bridge_time + bridge_answer_time,
+            "full_answer": answer_from_full,
+            "full_extracted": full_extracted,
+            "full_score": full_score,
+            "full_time_s": full_answer_time,
+        })
+
+    # Summary
+    print(f"\n{'=' * 60}")
+    print("BENCHMARK RESULTS")
+    print(f"{'=' * 60}")
+    bridge_exact = sum(1 for r in results if r["bridge_score"] == 1.0)
+    full_exact = sum(1 for r in results if r["full_score"] == 1.0)
+    bridge_avg = sum(r["bridge_score"] for r in results) / len(results)
+    full_avg = sum(r["full_score"] for r in results) / len(results)
+    avg_ratio = sum(r["bridge_ratio"] for r in results) / len(results)
+    print(f"  Bridge: {bridge_exact}/{len(results)} exact = {bridge_exact/len(results)*100:.1f}%, avg_score={bridge_avg:.3f}")
+    print(f"  Full:   {full_exact}/{len(results)} exact = {full_exact/len(results)*100:.1f}%, avg_score={full_avg:.3f}")
+    print(f"  Avg bridge ratio: {avg_ratio*100:.0f}%")
+
+    # Save
+    save_path = args.save or f"results/bridge_oolong_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    output = {
+        "timestamp": datetime.now().isoformat(),
+        "data_file": args.data,
+        "num_tasks": len(tasks),
+        "results": results,
+    }
+    Path(save_path).write_text(json.dumps(output, indent=2))
+    print(f"\nResults saved to {save_path}")
+
+
 # --- CLI ---
 
 def main():
@@ -254,6 +349,12 @@ def main():
     p_run.add_argument("--chunks", type=int, default=3, help="Number of chunks (default: 3)")
     p_run.add_argument("--save", help="Save results to JSON file")
     p_run.set_defaults(func=cmd_run)
+
+    p_bench = sub.add_parser("benchmark", help="Run bridge on OOLONG benchmark")
+    p_bench.add_argument("data", help="Path to OOLONG benchmark JSON")
+    p_bench.add_argument("--limit", type=int, help="Limit number of tasks")
+    p_bench.add_argument("--save", help="Save results to JSON")
+    p_bench.set_defaults(func=cmd_benchmark)
 
     args = parser.parse_args()
 

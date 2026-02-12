@@ -1,0 +1,10 @@
+[project]
+name = "context-engine"
+version = "0.1.0"
+description = "Context Bridge — bridges between generative ground and questions for any long-form context"
+requires-python = ">=3.12"
+dependencies = [
+    "openai",
+    "rlms @ git+https://github.com/alexzhang13/rlm.git",
+    "datasets",
+]

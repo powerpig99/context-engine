@@ -2,3 +2,6 @@ CLAUDE.md
 .venv/
 __pycache__/
 results/
+logs/
+.DS_Store
+benchmarks/oolong_trec_coarse_full.json
