@@ -152,11 +152,13 @@ def run_base_model(tasks: list[dict], client: OpenAI, model: str) -> list[dict]:
         try:
             response = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": "/no_think\n" + prompt}],
                 temperature=0.1,
                 max_tokens=512,
             )
             answer = response.choices[0].message.content
+            # Strip any residual <think>...</think> blocks from Qwen3
+            answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip()
             elapsed = time.time() - t0
             score = score_answer(answer, task["answer"], task["answer_type"])
             extracted = extract_answer(answer)

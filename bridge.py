@@ -50,7 +50,7 @@ def generate(system_prompt: str, user_prompt: str, temperature: float = 0.5, max
 
 # --- Core operations ---
 
-def build_bridge(text: str) -> str:
+def build_bridge(text: str, temperature: float = 0.5) -> str:
     """Build a bridge from text. Not a summary — the generative ground."""
     return generate(
         system_prompt=(
@@ -67,10 +67,11 @@ def build_bridge(text: str) -> str:
             "Produce only the bridge. No commentary."
         ),
         user_prompt=text,
+        temperature=temperature,
     )
 
 
-def update_bridge(bridge: str, new_text: str) -> str:
+def update_bridge(bridge: str, new_text: str, temperature: float = 0.5) -> str:
     """Update an existing bridge with new content. Grow only where genuinely new."""
     return generate(
         system_prompt=(
@@ -85,10 +86,11 @@ def update_bridge(bridge: str, new_text: str) -> str:
             "Produce only the updated bridge. No commentary."
         ),
         user_prompt=f"CURRENT BRIDGE:\n{bridge}\n\nNEW CONTENT:\n{new_text}",
+        temperature=temperature,
     )
 
 
-def answer(question: str, context: str) -> str:
+def answer(question: str, context: str, temperature: float = 0.5) -> str:
     """Answer a question using the given context."""
     return generate(
         system_prompt=(
@@ -96,6 +98,7 @@ def answer(question: str, context: str) -> str:
             "Derive your answer from the context. Be direct and clear."
         ),
         user_prompt=f"CONTEXT:\n{context}\n\nQUESTION:\n{question}",
+        temperature=temperature,
     )
 
 
@@ -319,6 +322,338 @@ def cmd_benchmark(args):
     print(f"\nResults saved to {save_path}")
 
 
+def cmd_continuous(args):
+    """Continuous-context variant: accumulate context, build evolving bridge."""
+    from rlm_oolong import parse_answer_field, extract_answer, score_answer
+
+    tasks = json.loads(Path(args.data).read_text())
+    for task in tasks:
+        task["answer"] = parse_answer_field(task["answer"])
+    # Sort by context_len ascending to simulate growing context
+    tasks.sort(key=lambda t: (t["context_len"], t["id"]))
+    if args.limit:
+        tasks = tasks[:args.limit]
+    print(f"Loaded {len(tasks)} tasks from {args.data} (sorted by context_len)")
+    print(f"Re-bridge strategy: {args.rebridge}")
+
+    accumulated = ""
+    bridge = None
+    initial_bridge_size = None
+    rebridge_count = 0
+    results = []
+
+    for i, task in enumerate(tasks):
+        ctx = task["context_window_text"]
+        question = task["question"]
+        accumulated += ctx + "\n\n"
+
+        print(f"\n  [{i+1}/{len(tasks)}] ctx={task['context_len']} task={task['task']}")
+        print(f"    Accumulated: {len(accumulated)} chars")
+
+        # Build or update bridge
+        t0 = time.time()
+        if bridge is None:
+            bridge = build_bridge(accumulated)
+            initial_bridge_size = len(bridge)
+        else:
+            bridge = update_bridge(bridge, ctx)
+
+        # Re-bridge if strategy triggers it
+        did_rebridge = False
+        if args.rebridge == "threshold" and initial_bridge_size and len(bridge) > initial_bridge_size * 2:
+            bridge = build_bridge(bridge)
+            did_rebridge = True
+            rebridge_count += 1
+        elif args.rebridge == "every5" and (i + 1) % 5 == 0 and i > 0:
+            bridge = build_bridge(bridge)
+            did_rebridge = True
+            rebridge_count += 1
+
+        bridge_build_time = time.time() - t0
+        ratio = len(bridge) / len(accumulated) if accumulated else 0
+        rb_tag = " [RE-BRIDGED]" if did_rebridge else ""
+        print(f"    Bridge: {len(bridge)} chars ({ratio*100:.1f}% of {len(accumulated)}) in {bridge_build_time:.1f}s{rb_tag}")
+
+        # Answer from two sources: bridge vs isolated context
+        # 1. Bridge (the thing we're testing — can it replace growing context?)
+        t0 = time.time()
+        answer_bridge = answer(question, bridge)
+        bridge_time = time.time() - t0
+        bridge_extracted = extract_answer(answer_bridge)
+        bridge_score = score_answer(answer_bridge, task["answer"], task["answer_type"])
+
+        # 2. Isolated (just this task's context — the gold standard)
+        t0 = time.time()
+        answer_iso = answer(question, ctx)
+        iso_time = time.time() - t0
+        iso_extracted = extract_answer(answer_iso)
+        iso_score = score_answer(answer_iso, task["answer"], task["answer_type"])
+
+        b_label = f"OK ({bridge_score:.2f})" if bridge_score > 0 else "WRONG"
+        i_label = f"OK ({iso_score:.2f})" if iso_score > 0 else "WRONG"
+        print(f"    Bridge:   {b_label} [{bridge_extracted[:50]}]")
+        print(f"    Isolated: {i_label} [{iso_extracted[:50]}]")
+
+        results.append({
+            "step": i + 1,
+            "id": task["id"],
+            "context_len": task["context_len"],
+            "task": task["task"],
+            "task_group": task["task_group"],
+            "question": question,
+            "gold": task["answer"],
+            "accumulated_size": len(accumulated),
+            "bridge_size": len(bridge),
+            "bridge_ratio": ratio,
+            "did_rebridge": did_rebridge,
+            "bridge_extracted": bridge_extracted,
+            "bridge_score": bridge_score,
+            "iso_extracted": iso_extracted,
+            "iso_score": iso_score,
+        })
+
+    # Summary
+    print(f"\n{'=' * 60}")
+    print("CONTINUOUS-CONTEXT RESULTS")
+    print(f"{'=' * 60}")
+    n = len(results)
+    for label, key in [("Bridge", "bridge_score"), ("Isolated", "iso_score")]:
+        exact = sum(1 for r in results if r[key] == 1.0)
+        avg = sum(r[key] for r in results) / n
+        print(f"  {label:12s}: {exact}/{n} exact = {exact/n*100:.1f}%, avg_score={avg:.3f}")
+    final_ratio = results[-1]["bridge_ratio"] if results else 0
+    print(f"  Final bridge ratio: {final_ratio*100:.1f}%")
+    print(f"  Re-bridge operations: {rebridge_count}")
+    print(f"  Bridge size: {results[0]['bridge_size']} → {results[-1]['bridge_size']} chars")
+    print(f"  Accumulated size: {results[0]['accumulated_size']} → {results[-1]['accumulated_size']} chars")
+
+    # Save
+    save_path = args.save or f"results/bridge_continuous_{args.rebridge}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    output = {
+        "timestamp": datetime.now().isoformat(),
+        "data_file": args.data,
+        "num_tasks": n,
+        "rebridge_strategy": args.rebridge,
+        "rebridge_count": rebridge_count,
+        "results": results,
+    }
+    Path(save_path).write_text(json.dumps(output, indent=2))
+    print(f"\nResults saved to {save_path}")
+
+
+def cmd_fiveway(args):
+    """5-way comparison experiment: vanilla, RLM, per-task bridge, accumulated bridge, look-ahead bridge."""
+    from rlm_oolong import parse_answer_field, extract_answer, score_answer
+
+    TEMP = 0.0  # Deterministic for reproducibility
+
+    tasks = json.loads(Path(args.data).read_text())
+    for task in tasks:
+        task["answer"] = parse_answer_field(task["answer"])
+    if args.limit:
+        tasks = tasks[:args.limit]
+    print(f"Loaded {len(tasks)} tasks from {args.data}")
+
+    n = len(tasks)
+    # Pre-index unique context windows
+    ctx_map = {}  # context_window_id -> context text
+    for task in tasks:
+        cid = task["context_window_id"]
+        if cid not in ctx_map:
+            ctx_map[cid] = task["context_window_text"]
+    print(f"Unique context windows: {len(ctx_map)} (ids: {sorted(ctx_map.keys())})")
+
+    # Initialize per-task result dicts
+    results = []
+    for task in tasks:
+        results.append({
+            "id": task["id"],
+            "context_len": task["context_len"],
+            "context_window_id": task["context_window_id"],
+            "task": task["task"],
+            "task_group": task["task_group"],
+            "question": task["question"],
+            "gold": task["answer"],
+        })
+
+    # ── Phase 1: Vanilla baseline ──
+    print(f"\n{'=' * 60}")
+    print("PHASE 1: Vanilla (isolated context, direct answer)")
+    print(f"{'=' * 60}")
+    t_start = time.time()
+    for i, task in enumerate(tasks):
+        ctx = task["context_window_text"]
+        raw = answer(task["question"], ctx, temperature=TEMP)
+        extracted = extract_answer(raw)
+        sc = score_answer(raw, task["answer"], task["answer_type"])
+        results[i]["vanilla_raw"] = raw
+        results[i]["vanilla_extracted"] = extracted
+        results[i]["vanilla_score"] = sc
+        label = f"OK ({sc:.2f})" if sc > 0 else "WRONG"
+        print(f"  [{i+1}/{n}] {label} [{extracted[:60]}]")
+    print(f"  Phase 1 done in {time.time() - t_start:.1f}s")
+
+    # ── Phase 2: RLM from cache ──
+    print(f"\n{'=' * 60}")
+    print("PHASE 2: RLM + REPL (from cache)")
+    print(f"{'=' * 60}")
+    if args.rlm_cache:
+        rlm_data = json.loads(Path(args.rlm_cache).read_text())
+        rlm_results_raw = rlm_data["results"]
+        # Index by task id
+        rlm_by_id = {r["id"]: r for r in rlm_results_raw}
+        for i, task in enumerate(tasks):
+            cached = rlm_by_id.get(task["id"])
+            if cached and cached.get("predicted"):
+                # Rescore with current score_answer for consistency
+                sc = score_answer(cached["predicted"], task["answer"], task["answer_type"])
+                extracted = extract_answer(cached["predicted"])
+                results[i]["rlm_raw"] = cached["predicted"]
+                results[i]["rlm_extracted"] = extracted
+                results[i]["rlm_score"] = sc
+            else:
+                results[i]["rlm_raw"] = None
+                results[i]["rlm_extracted"] = ""
+                results[i]["rlm_score"] = 0.0
+            label = f"OK ({results[i]['rlm_score']:.2f})" if results[i]["rlm_score"] > 0 else "WRONG"
+            print(f"  [{i+1}/{n}] {label} [{results[i]['rlm_extracted'][:60]}]")
+        print(f"  Loaded {sum(1 for r in results if r.get('rlm_raw'))} cached RLM results")
+    else:
+        print("  No --rlm-cache provided, skipping RLM. Scores set to 0.")
+        for i in range(n):
+            results[i]["rlm_raw"] = None
+            results[i]["rlm_extracted"] = ""
+            results[i]["rlm_score"] = 0.0
+
+    # ── Phase 3: Per-task bridge ──
+    print(f"\n{'=' * 60}")
+    print("PHASE 3: Per-task bridge (bridge per unique context window)")
+    print(f"{'=' * 60}")
+    t_start = time.time()
+    bridge_cache = {}  # context_window_id -> bridge text
+    for cid, ctx_text in ctx_map.items():
+        print(f"  Building bridge for context_window_id={cid} ({len(ctx_text)} chars)...")
+        bridge_cache[cid] = build_bridge(ctx_text, temperature=TEMP)
+        print(f"    Bridge: {len(bridge_cache[cid])} chars ({len(bridge_cache[cid])/len(ctx_text)*100:.0f}%)")
+
+    for i, task in enumerate(tasks):
+        bridge = bridge_cache[task["context_window_id"]]
+        raw = answer(task["question"], bridge, temperature=TEMP)
+        extracted = extract_answer(raw)
+        sc = score_answer(raw, task["answer"], task["answer_type"])
+        results[i]["pertask_raw"] = raw
+        results[i]["pertask_extracted"] = extracted
+        results[i]["pertask_score"] = sc
+        label = f"OK ({sc:.2f})" if sc > 0 else "WRONG"
+        print(f"  [{i+1}/{n}] {label} [{extracted[:60]}]")
+    print(f"  Phase 3 done in {time.time() - t_start:.1f}s")
+
+    # ── Phase 4: Accumulated bridge ──
+    print(f"\n{'=' * 60}")
+    print("PHASE 4: Accumulated bridge (sequential, threshold re-bridge)")
+    print(f"{'=' * 60}")
+    t_start = time.time()
+    # Sort tasks by context_len for accumulation
+    sorted_indices = sorted(range(n), key=lambda j: (tasks[j]["context_len"], tasks[j]["id"]))
+    accum_bridge = None
+    initial_bridge_size = None
+    rebridge_count = 0
+
+    for step, idx in enumerate(sorted_indices):
+        task = tasks[idx]
+        ctx = task["context_window_text"]
+
+        if accum_bridge is None:
+            accum_bridge = build_bridge(ctx, temperature=TEMP)
+            initial_bridge_size = len(accum_bridge)
+        else:
+            accum_bridge = update_bridge(accum_bridge, ctx, temperature=TEMP)
+
+        # Threshold re-bridge: if bridge > 2x initial size
+        did_rebridge = False
+        if initial_bridge_size and len(accum_bridge) > initial_bridge_size * 2:
+            accum_bridge = build_bridge(accum_bridge, temperature=TEMP)
+            did_rebridge = True
+            rebridge_count += 1
+
+        raw = answer(task["question"], accum_bridge, temperature=TEMP)
+        extracted = extract_answer(raw)
+        sc = score_answer(raw, task["answer"], task["answer_type"])
+        results[idx]["accum_raw"] = raw
+        results[idx]["accum_extracted"] = extracted
+        results[idx]["accum_score"] = sc
+        results[idx]["accum_bridge_size"] = len(accum_bridge)
+        results[idx]["accum_did_rebridge"] = did_rebridge
+
+        rb_tag = " [RE-BRIDGED]" if did_rebridge else ""
+        label = f"OK ({sc:.2f})" if sc > 0 else "WRONG"
+        print(f"  [{step+1}/{n}] ctx={task['context_len']} bridge={len(accum_bridge)} {label}{rb_tag} [{extracted[:50]}]")
+
+    print(f"  Phase 4 done in {time.time() - t_start:.1f}s (re-bridges: {rebridge_count})")
+
+    # ── Phase 5: Look-ahead bridge ──
+    print(f"\n{'=' * 60}")
+    print("PHASE 5: Look-ahead bridge (shared bridge from all contexts)")
+    print(f"{'=' * 60}")
+    t_start = time.time()
+    # Concatenate all unique contexts
+    all_contexts = "\n\n".join(ctx_map[cid] for cid in sorted(ctx_map.keys()))
+    print(f"  Building shared bridge from {len(all_contexts)} chars ({len(ctx_map)} contexts)...")
+    shared_bridge = build_bridge(all_contexts, temperature=TEMP)
+    print(f"  Shared bridge: {len(shared_bridge)} chars ({len(shared_bridge)/len(all_contexts)*100:.1f}%)")
+
+    for i, task in enumerate(tasks):
+        ctx = task["context_window_text"]
+        # Enrich shared bridge with task-specific context
+        enriched = update_bridge(shared_bridge, ctx, temperature=TEMP)
+        raw = answer(task["question"], enriched, temperature=TEMP)
+        extracted = extract_answer(raw)
+        sc = score_answer(raw, task["answer"], task["answer_type"])
+        results[i]["lookahead_raw"] = raw
+        results[i]["lookahead_extracted"] = extracted
+        results[i]["lookahead_score"] = sc
+        results[i]["lookahead_bridge_size"] = len(enriched)
+        label = f"OK ({sc:.2f})" if sc > 0 else "WRONG"
+        print(f"  [{i+1}/{n}] enriched={len(enriched)} {label} [{extracted[:60]}]")
+    print(f"  Phase 5 done in {time.time() - t_start:.1f}s")
+
+    # ── Phase 6: Summary table ──
+    print(f"\n{'=' * 60}")
+    print("5-WAY COMPARISON RESULTS")
+    print(f"{'=' * 60}")
+
+    approaches = [
+        ("Vanilla (baseline)", "vanilla_score"),
+        ("RLM + REPL", "rlm_score"),
+        ("Per-task bridge", "pertask_score"),
+        ("Accumulated bridge", "accum_score"),
+        ("Look-ahead bridge", "lookahead_score"),
+    ]
+
+    print(f"\n{'Approach':<26s} {'Exact':>8s} {'Pct':>8s} {'Avg Score':>10s}")
+    print("-" * 54)
+    summary = {}
+    for label, key in approaches:
+        exact = sum(1 for r in results if r.get(key, 0) == 1.0)
+        avg = sum(r.get(key, 0) for r in results) / n
+        pct = exact / n * 100
+        print(f"{label:<26s} {exact:>4d}/{n:<3d} {pct:>6.1f}% {avg:>10.3f}")
+        summary[key.replace("_score", "")] = {"exact": exact, "total": n, "pct": round(pct, 1), "avg_score": round(avg, 3)}
+
+    # Save
+    save_path = args.save or f"results/fiveway_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+    output = {
+        "timestamp": datetime.now().isoformat(),
+        "config": {"temperature": TEMP, "data_file": args.data, "num_tasks": n, "rlm_cache": args.rlm_cache},
+        "summary": summary,
+        "results": results,
+    }
+    Path(save_path).write_text(json.dumps(output, indent=2))
+    print(f"\nResults saved to {save_path}")
+
+
 # --- CLI ---
 
 def main():
@@ -355,6 +690,21 @@ def main():
     p_bench.add_argument("--limit", type=int, help="Limit number of tasks")
     p_bench.add_argument("--save", help="Save results to JSON")
     p_bench.set_defaults(func=cmd_benchmark)
+
+    p_cont = sub.add_parser("continuous", help="Continuous-context: accumulate and bridge over time")
+    p_cont.add_argument("data", help="Path to OOLONG benchmark JSON")
+    p_cont.add_argument("--limit", type=int, help="Limit number of tasks")
+    p_cont.add_argument("--rebridge", choices=["none", "threshold", "every5"], default="none",
+                         help="Re-bridging strategy (default: none)")
+    p_cont.add_argument("--save", help="Save results to JSON")
+    p_cont.set_defaults(func=cmd_continuous)
+
+    p_five = sub.add_parser("fiveway", help="5-way comparison experiment")
+    p_five.add_argument("data", nargs="?", default="benchmarks/oolong_trec_coarse_30.json")
+    p_five.add_argument("--limit", type=int, help="Limit number of tasks")
+    p_five.add_argument("--rlm-cache", help="Cached RLM results JSON")
+    p_five.add_argument("--save", help="Save results JSON")
+    p_five.set_defaults(func=cmd_fiveway)
 
     args = parser.parse_args()
 
