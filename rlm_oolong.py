@@ -294,23 +294,34 @@ def main():
         print("RLM (with REPL)")
         print(f"{'=' * 60}")
         logger = RLMLogger(log_dir="./logs")
-        # Disable Qwen3's <think> mode via /no_think directive and enforce REPL usage
         custom_prompt = (
             RLM_SYSTEM_PROMPT
-            + "\n\n/no_think\n"
-            "CRITICAL: Never use <think> tags. Write ```repl``` code blocks immediately. "
+            + "\n\nCRITICAL: Never use <think> tags. Write ```repl``` code blocks immediately. "
             "Always end with FINAL(your_answer) when you have the answer."
         )
+        # Monkey-patch OpenAIClient to inject /no_think into user messages for Qwen3
+        from rlm.clients.openai import OpenAIClient
+        if not hasattr(OpenAIClient, '_original_completion'):
+            OpenAIClient._original_completion = OpenAIClient.completion
+            def _patched_completion(self, prompt, model=None):
+                if isinstance(prompt, list):
+                    for msg in reversed(prompt):
+                        if msg.get("role") == "user":
+                            msg["content"] = "/no_think\n" + msg["content"]
+                            break
+                return OpenAIClient._original_completion(self, prompt, model=model)
+            OpenAIClient.completion = _patched_completion
+
         rlm_instance = RLM(
             backend="openai",
             backend_kwargs={
-                "model_name": "mlx-community/Qwen3-8B-4bit",
+                "model_name": "default",
                 "base_url": "http://localhost:8000/v1",
                 "api_key": "not-needed",
             },
             environment="local",
             max_depth=1,
-            max_iterations=10,
+            max_iterations=30,
             custom_system_prompt=custom_prompt,
             logger=logger,
             verbose=True,

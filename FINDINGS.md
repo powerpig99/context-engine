@@ -97,12 +97,54 @@ All strategies: bridge at 0.1% of accumulated context (117-214 chars vs 167,580 
 - Final bridge size plateaus at 0.1% of accumulated context
 - Threshold re-bridging (when size > 2x initial) is optimal strategy
 
-## Next Steps: Context Length Scaling
+## RLM Deep Investigation (Session 4)
 
-Running 5 tasks per context length, base + RLM, stepping through:
-1K → 2K → 4K → 8K → 16K → 32K → 65K → 131K
+### Why RLM(Qwen3-8B) fails on OOLONG — verified root cause
 
-Goal: map the full crossover curve and identify where bridge should be tested.
+Investigated three hypotheses for why our RLM scores are low:
+
+**1. `/no_think` placement was wrong** (verified, fixed, didn't help)
+- Our `/no_think` was in the system prompt only. RLM constructs multi-turn messages — system → assistant → user → assistant → user → ...
+- Qwen3 needs `/no_think` in **user messages**, not system. After iteration 1, thinking re-enabled.
+- Fixed via monkey-patching `OpenAIClient.completion` to inject `/no_think` into last user message.
+- Result: still 0/5 at 1K. Fix was correct but not the bottleneck.
+
+**2. `max_iterations` was too low** (verified, fixed, didn't help)
+- Default is 30, we used 10. Fixed to 30.
+- Result: model hits same dead end more times. Extra iterations = more failed attempts at text parsing.
+
+**3. RLM library matches paper's code** (verified)
+- `rlm` pip package v0.1.0 is byte-for-byte identical to GitHub `main` branch.
+- `llm_query()` timeout: 300s hardcoded. OpenAI client sends zero generation params.
+- No OOLONG-specific prompt. No Qwen3-specific handling in the library.
+
+**Actual root cause: the 8B model can't formulate the right REPL strategy.**
+
+OOLONG requires:
+1. Read each question (e.g., "What does NAFTA stand for?")
+2. **Semantically classify it** into a category (→ "abbreviation")
+3. Count categories across all questions
+
+The model instead:
+- Tries to `grep` literal label strings from text (finds 0 matches — labels aren't in the data)
+- Extracts category names from the header (gets equal counts for each category — just the header text)
+- Falls back to "same frequency as" or "cannot determine"
+
+The correct strategy would use `llm_query()` to classify each question one-by-one — but Qwen3-8B never discovers this approach. This is a **model capability** limitation, not a configuration issue.
+
+### Context length scaling data (bf16, 5 tasks each)
+
+| Context | Vanilla | RLM (old) | RLM (fixed) |
+|---------|---------|-----------|-------------|
+| 1K | 1/10=10% | 4/10=40% | 0/5=0% |
+| 2K | 0/10=0% | 2/10=20% | — |
+| 4K | 6/10=60% | 0/10=0% | — |
+| 8K | 2/5=40% | 1/5=20% | — |
+| 16K | 1/5=20% | 0/4=0%* | — |
+
+*16K RLM: 4/5 completed (all WRONG), 5th timed out on `llm_query()`.
+
+**The "old" RLM 40% at 1K was inflated by lucky guessing with fewer iterations (10 vs 30).** With 30 iterations the model has more time to converge on the wrong strategy.
 
 ## Technical Notes
 
@@ -117,6 +159,8 @@ Goal: map the full crossover curve and identify where bridge should be tested.
 
 ### Session 4 (bf16)
 - `results/rlm_oolong_bf16_30.json` — Base + RLM, 30 tasks, bf16
+- `results/baseline_8k_5.json` — Base + RLM, 5 tasks at 8K, bf16
+- `results/rlm_fixed_1k_5.json` — RLM with fixes (/no_think + max_iter=30), 5 tasks at 1K
 
 ### Sessions 1-3 (4-bit, historical)
 - `results/rlm_oolong_20260212_090513.json` — RLM 30-task run
