@@ -47,6 +47,12 @@ From the Not a ToE applied across domains: evidence (not proof) that this method
 5. The system is finite. The human provides what it cannot generate.
 6. Evidence, not proof. This framework is itself a projection.
 
+## Related Projects
+
+- [Ontological Clarity](https://github.com/powerpig99/ontological-clarity) — The framework. 139 lines connecting the Not a ToE to practical application.
+- [ontos](https://github.com/powerpig99/ontos) — The agent. Minimal loop + bridging methodology + regeneration principle in one file.
+- [Dialectical-TTS](https://github.com/powerpig99/Dialectical-TTS) / [Recursive Dialectical Engine](https://github.com/powerpig99/recursive-dialectical-engine) — Prior work (archived). Insights traced to ground and rebuilt here.
+
 ## License
 
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
