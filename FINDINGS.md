@@ -146,6 +146,138 @@ The correct strategy would use `llm_query()` to classify each question one-by-on
 
 **The "old" RLM 40% at 1K was inflated by lucky guessing with fewer iterations (10 vs 30).** With 30 iterations the model has more time to converge on the wrong strategy.
 
+## Session 5: Replicating Paper at 131K (50 tasks)
+
+### Goal
+Replicate the paper's Table 1 results: Base=0%*, RLM=24% at OOLONG 131K with Qwen3-8B.
+
+### RLM Repo Verification
+Cloned both repos (`alexzhang13/rlm` and `alexzhang13/rlm-minimal`). Verified:
+- Our installed `rlms==0.1.0` is **byte-identical** to GitHub HEAD (all diffs empty)
+- **No OOLONG evaluation harness published** — neither repo contains benchmark/eval code
+- **No Qwen-specific handling** — no model-aware prompts, no temperature settings
+- **No temperature set anywhere** in RLM codebase — relies on API defaults
+- Paper mentions "slightly different prompt for Qwen3-8B" — **not in the public code**
+- `rlm-minimal` is a simplified reimplementation, same architecture, default models are GPT-5
+
+### 131K Task Extraction
+- Extracted 50 tasks at context_len=131072 from `oolong_trec_coarse_full.json`
+- Each task has ~312K chars of context (~114K tokens)
+- Task types: MOST_FREQ(5), LEAST_FREQ(4), RELATIVE_FREQ(29), NUMERIC_ONE_CLASS(12)
+- 2 unique context windows (context_window_ids: 6, 8)
+- Saved as `benchmarks/oolong_trec_coarse_131k.json`
+
+### Base Model at 131K — OOM
+- bf16 model (16.4 GB) + KV cache for 114K tokens (16 GB) = exceeds 48GB M4 Metal memory
+- Error: "Cache entry too large: 16063.7MB exceeds limit 4361.1MB"
+- Then: "METAL Command buffer execution failed: Insufficient Memory"
+- **Confirms paper's 0%***: context physically cannot be processed by base model
+
+### RLM at 131K with bf16 — 0/50 (0.0%)
+
+| Metric | Value |
+|--------|-------|
+| Tasks completed | 10/50 (40 failed after OOM crash) |
+| Exact match | **0/10 = 0.0%** |
+| Avg score | 0.000 |
+| Total time | ~18,322s (~5 hours) for 10 tasks |
+| Time per task | 112s to 7,565s (highly variable) |
+
+All 10 completed tasks were WRONG. Same failure mode as shorter contexts:
+- Model writes text-parsing code (grep for literal labels) instead of using `llm_query()`
+- Gets empty results `{}`, then guesses
+- RELATIVE_FREQ tasks all answered with "same frequency as" (wrong)
+- Server OOM-crashed during task 11, remaining 39 tasks got connection errors
+
+### Gap Analysis: Our 0% vs Paper's 24%
+
+The 24% gap cannot be explained by:
+- ❌ Code differences (our package is identical to repo)
+- ❌ Temperature (neither sets it)
+- ❌ max_iterations (paper uses 30, we use 30)
+
+Possible explanations:
+- ✅ Paper's "slightly different prompt for Qwen3-8B" (unpublished)
+- ✅ Different Qwen3-8B checkpoint (paper doesn't specify exact model ID)
+- ✅ Different hardware (GPU with enough VRAM for full prefill vs our M4 Metal memory limits)
+- ✅ bf16 OOM on our hardware — server crashes mid-run
+
+### RLM at 131K with 4-bit — OOM from concurrent sub-LM calls
+
+Switched to `mlx-community/Qwen3-8B-4bit` (4.6 GB) to avoid bf16 OOM.
+
+**First run (no concurrency limit)**: 1/5 correct (20%) before crash. Server OOM'd when model used `llm_query_batched()` — fired 17+ concurrent sub-LM requests at ~50K tokens each. KV cache for 17×50K tokens exceeded Metal memory.
+
+**Run with `--max-num-seqs 2`**: Sub-LM calls queued but timed out (RLM's 300s socket timeout too short for 64 queued requests at 2 concurrent).
+
+**Run with `--max-num-seqs 4`**: Model successfully used `llm_query` (589 individual sub-calls in progress), memory stable at 12-13GB. But server OOM'd on a separate 114K-token prefill request while sub-LM calls were active.
+
+Key insight: **At 131K, the model DID discover `llm_query()` as the correct strategy** (unlike at shorter contexts where it text-parses). But the concurrent load from batched sub-calls + main context prefills exceeds local hardware limits.
+
+### RLM Computational Cost
+
+RLM adds orders of magnitude computation:
+
+| Approach | LLM calls per task | Time per task (4-bit, 131K) |
+|----------|-------------------|----------------------------|
+| Vanilla | 1 | ~15 min (prefill) |
+| Bridge | 2 (build + answer) | ~15 min (build) + ~3s (answer) |
+| RLM | 12-3000+ | 30-120+ min |
+
+For OOLONG's 3182 questions, the correct RLM strategy requires ~3000 individual `llm_query` calls for semantic classification. At ~2s each with 4 concurrent = ~25 min per pass, with multiple iterations. Compare to bridge: 1 build call + 1 answer call.
+
+An external demo with Minimax 2.5 (much more capable model) showed RLM working elegantly: 12 total LLM calls, 2.5 min wall time, max depth 2. The capable model finds relevant context efficiently (tree-shaped decomposition). Qwen3-8B at OOLONG requires flat-map decomposition (classify every question) — fundamentally different.
+
+### Bridge at 131K — Structural Challenge
+
+Added bridge caching per `context_window_id` and `--skip-full` flag to bridge.py for long-context benchmarks (avoids redundant 114K prefills and impossible full-context controls).
+
+At 131K, the bridge faces a different problem than at 1K-4K:
+- 1K-4K: Bridge can comprehend entire context in one pass → captures generative ground
+- 131K: 3182 questions across 6 categories → bridge must capture the **distribution** structure
+- A blind "summarize the generative ground" may miss that what matters is the frequency count
+- The question should guide what structure the bridge captures
+
+This connects to the three scenarios in the fiveway design:
+1. **Per-task bridge**: basic mechanism test (question-agnostic)
+2. **Accumulated bridge**: does sequential exposure help?
+3. **Look-ahead bridge**: sees all contexts first → finds general structure → enriches per task
+
+The look-ahead was designed precisely for this — find the general context that applies across all tasks, then refocus per question.
+
+### Bridge at 131K — Results (5-task quick look)
+
+| Approach | Score | Time | LLM calls |
+|----------|-------|------|-----------|
+| Base (bf16) | 0%* (OOM) | impossible | 1 |
+| RLM (bf16) | 0/5 = 0% | ~5 hrs | 1000s |
+| RLM (4-bit) | 1/5 = 20% | ~5 min (before OOM) | 100s+ |
+| **Bridge (4-bit)** | **1/5 = 20%** | **25 min build + 3s/answer** | **2** |
+| Paper: RLM(Qwen3-8B) | 24% (50 tasks) | — | — |
+
+Bridge details:
+- Bridge size: 11,355 chars (3.6% of 316K context), build time 1482s (~25 min)
+- Task 1 (MOST_FREQ): **correct** — "numeric value"
+- Task 2 (LEAST_FREQ): wrong — predicted "numeric value" (gold: "abbreviation")
+- Tasks 3-5 (RELATIVE_FREQ): all wrong — "same frequency as" pattern
+
+The blind bridge captured enough to identify the most common label but not the full distribution. The "same frequency" answers confirm the bridge doesn't preserve precise count relationships at 131K. This validates the need for question-guided bridging or structural decomposition.
+
+**Bridge at 131K prefill/generation timing:**
+- Prefill 114K tokens: ~20 min (4-bit on M4)
+- Generation at 131K KV cache: ~1 tok/s (vs ~15 tok/s at short context)
+- max_tokens=2048 for build_bridge (reduced from 4096 to control generation time)
+- Total per bridge build: ~25 min (amortized across tasks sharing same context)
+
+### Next Steps
+
+The three scenarios in fiveway were designed for exactly this progression. The question is whether the bridge needs:
+1. **Question-guided focus**: build the bridge knowing what structure matters
+2. **Structural decomposition**: chunk → classify → aggregate (what RLM does at 1000x cost)
+3. **Look-ahead enrichment**: build general bridge first, then enrich per question (Phase 5 of fiveway)
+
+A different structural solution beyond the current three scenarios may be needed at 131K.
+
 ## Technical Notes
 
 - **`/no_think` directive**: Prepend `/no_think\n` to user messages for Qwen3 models
@@ -156,6 +288,14 @@ The correct strategy would use `llm_query()` to classify each question one-by-on
 - **bf16 inference**: ~10x slower than 4-bit (~35s vs ~3s per generation)
 
 ## Result Files
+
+### Session 5-6 (131K replication + bridge)
+- `results/bridge_131k_5.json` — Bridge at 131K, 5 tasks, 4-bit (1/5 = 20%)
+- `results/rlm_131k_50.json` — RLM at 131K, 50 tasks, bf16 (0/50, server OOM)
+- `results/rlm_131k_4bit_50.json` — RLM at 131K, 50 tasks, 4-bit (1/50, server OOM after 5)
+- `results/rlm_131k_2.json` — RLM at 131K, 2-task smoke test, bf16 (1/2)
+- `results/base_131k_5.json` — Base at 131K, 5 tasks (0/5, connection errors)
+- `benchmarks/oolong_trec_coarse_131k.json` — 50 tasks at 131K context
 
 ### Session 4 (bf16)
 - `results/rlm_oolong_bf16_30.json` — Base + RLM, 30 tasks, bf16

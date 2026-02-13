@@ -280,7 +280,7 @@ def main():
         print(f"\n{'=' * 60}")
         print("BASE MODEL (direct prompting, no REPL)")
         print(f"{'=' * 60}")
-        client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+        client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed", timeout=1800)
         base_results = run_base_model(tasks, client, "default")
         all_results.extend(base_results)
 

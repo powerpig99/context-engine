@@ -27,7 +27,7 @@ from openai import OpenAI
 
 # --- Provider (minimal, no abstraction needed for one experiment) ---
 
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed", timeout=1800)
 MODEL = "default"
 
 
@@ -50,7 +50,7 @@ def generate(system_prompt: str, user_prompt: str, temperature: float = 0.5, max
 
 # --- Core operations ---
 
-def build_bridge(text: str, temperature: float = 0.5) -> str:
+def build_bridge(text: str, temperature: float = 0.5, max_tokens: int = 2048) -> str:
     """Build a bridge from text. Not a summary — the generative ground."""
     return generate(
         system_prompt=(
@@ -68,6 +68,7 @@ def build_bridge(text: str, temperature: float = 0.5) -> str:
         ),
         user_prompt=text,
         temperature=temperature,
+        max_tokens=max_tokens,
     )
 
 
@@ -245,18 +246,40 @@ def cmd_benchmark(args):
         tasks = tasks[:args.limit]
     print(f"Loaded {len(tasks)} tasks from {args.data}")
 
+    # Cache bridges per unique context_window_id to avoid redundant prefills
+    bridge_cache = {}  # context_window_id -> (bridge_text, bridge_time)
+    ctx_map = {}  # context_window_id -> context_text
+    for task in tasks:
+        cid = task.get("context_window_id")
+        if cid is not None and cid not in ctx_map:
+            ctx_map[cid] = task["context_window_text"]
+    if ctx_map:
+        print(f"Unique context windows: {len(ctx_map)} (ids: {sorted(ctx_map.keys())})")
+        for cid, ctx_text in ctx_map.items():
+            print(f"  Building bridge for context_window_id={cid} ({len(ctx_text)} chars)...")
+            t0 = time.time()
+            bridge_cache[cid] = build_bridge(ctx_text)
+            bt = time.time() - t0
+            print(f"    Bridge: {len(bridge_cache[cid])} chars ({len(bridge_cache[cid])/len(ctx_text)*100:.1f}%) in {bt:.1f}s")
+
+    skip_full = getattr(args, "skip_full", False)
+
     results = []
     for i, task in enumerate(tasks):
         ctx = task["context_window_text"]
         question = task["question"]
+        cid = task.get("context_window_id")
         print(f"\n  [{i+1}/{len(tasks)}] ctx={task['context_len']} task={task['task']}")
 
-        # 1. Build bridge from context
+        # 1. Build bridge from context (use cache if available)
         t0 = time.time()
-        bridge = build_bridge(ctx)
-        bridge_time = time.time() - t0
+        if cid is not None and cid in bridge_cache:
+            bridge = bridge_cache[cid]
+            bridge_time = 0.0  # amortized
+        else:
+            bridge = build_bridge(ctx)
+            bridge_time = time.time() - t0
         ratio = len(bridge) / len(ctx)
-        print(f"    Bridge: {len(bridge)} chars ({ratio*100:.0f}% of {len(ctx)}) in {bridge_time:.1f}s")
 
         # 2. Answer from bridge
         t0 = time.time()
@@ -265,17 +288,24 @@ def cmd_benchmark(args):
         bridge_extracted = extract_answer(answer_from_bridge)
         bridge_score = score_answer(answer_from_bridge, task["answer"], task["answer_type"])
 
-        # 3. Answer from full context (control)
-        t0 = time.time()
-        answer_from_full = answer(question, ctx)
-        full_answer_time = time.time() - t0
-        full_extracted = extract_answer(answer_from_full)
-        full_score = score_answer(answer_from_full, task["answer"], task["answer_type"])
+        # 3. Answer from full context (control) — skip if flag set
+        if skip_full:
+            answer_from_full = ""
+            full_extracted = ""
+            full_score = 0.0
+            full_answer_time = 0.0
+        else:
+            t0 = time.time()
+            answer_from_full = answer(question, ctx)
+            full_answer_time = time.time() - t0
+            full_extracted = extract_answer(answer_from_full)
+            full_score = score_answer(answer_from_full, task["answer"], task["answer_type"])
 
         b_label = f"OK ({bridge_score:.2f})" if bridge_score > 0 else "WRONG"
-        f_label = f"OK ({full_score:.2f})" if full_score > 0 else "WRONG"
-        print(f"    Bridge answer: {b_label} [{bridge_extracted[:60]}]")
-        print(f"    Full answer:   {f_label} [{full_extracted[:60]}]")
+        print(f"    Bridge: {len(bridge)} chars ({ratio*100:.1f}%) {b_label} [{bridge_extracted[:60]}]")
+        if not skip_full:
+            f_label = f"OK ({full_score:.2f})" if full_score > 0 else "WRONG"
+            print(f"    Full:   {f_label} [{full_extracted[:60]}]")
 
         results.append({
             "id": task["id"],
@@ -688,6 +718,7 @@ def main():
     p_bench = sub.add_parser("benchmark", help="Run bridge on OOLONG benchmark")
     p_bench.add_argument("data", help="Path to OOLONG benchmark JSON")
     p_bench.add_argument("--limit", type=int, help="Limit number of tasks")
+    p_bench.add_argument("--skip-full", action="store_true", help="Skip full-context control (for long contexts)")
     p_bench.add_argument("--save", help="Save results to JSON")
     p_bench.set_defaults(func=cmd_benchmark)
 
